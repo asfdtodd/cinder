@@ -84,6 +84,10 @@ PURE_OPTS = [
     cfg.StrOpt("pure_replication_pod_name", default="cinder-pod",
                help="Pure Pod name to use for sync replication "
                     "(will be created if it does not exist)."),
+    cfg.StrOpt("pure_volume_group_name", default="cinder-volumes",
+               help="Pure volume group name to store cinder volumes in. "
+                    "defaults to cinder-volumes, set to an empty string"
+                    "to disable putting volumes in a volume group"),
     cfg.StrOpt("pure_iscsi_cidr", default="0.0.0.0/0",
                help="CIDR of FlashArray iSCSI targets hosts are allowed to "
                     "connect to. Default will allow connection to any "
@@ -211,6 +215,7 @@ class PureBaseVolumeDriver(san.SanDriver):
         self._replication_retention_long_term = None
         self._replication_retention_long_term_per_day = None
         self._async_replication_retention_policy = None
+        self._vgroup_name = None
         self._is_replication_enabled = False
         self._is_active_cluster_enabled = False
         self._active_backend_id = kwargs.get('active_backend_id', None)
@@ -335,6 +340,11 @@ class PureBaseVolumeDriver(san.SanDriver):
         self._array.preferred = True
         self._array.uniform = True
 
+        self._vgroup_name = self.configuration.safe_get('pure_volume_group_name')
+        # Set vgroup_name to None if value is ""
+        if self._vgroup_name == "":
+            self._vgroup_name = None
+
         LOG.info("Primary array: backend_id='%s', name='%s', id='%s'",
                  self.configuration.config_group,
                  self._array.array_name,
@@ -451,6 +461,8 @@ class PureBaseVolumeDriver(san.SanDriver):
                 array.destroy_volume(purity_vol_name)
                 array.eradicate_volume(purity_vol_name)
 
+        self._add_to_volume_group_if_needed(purity_vol_name, self._vgroup_name)
+
         repl_status = fields.ReplicationStatus.DISABLED
         if self._is_vol_in_pod(purity_vol_name) or async_enabled:
             repl_status = fields.ReplicationStatus.ENABLED
@@ -460,6 +472,58 @@ class PureBaseVolumeDriver(san.SanDriver):
             'replication_status': repl_status,
         }
         return model_update
+
+    def _create_volume_group_if_not_exist(self, source_array, vgroup_name):
+      if not vgroup_name:
+          raise PureDriverException(
+            reason=_("Empty string passed for VG name. We should not be here"))
+
+      try:
+        source_array.create_vgroup(vgroup_name)
+      except purestorage.PureHTTPError as err:
+          with excutils.save_and_reraise_exception() as ctxt:
+              if err.code = 400 and ERR_MSG_ALREADY_EXISTS in err.text:
+                  ctxt.reraise = False
+                  LOG.warning("Skipping creation of VG %s since it "
+                              "already exists.", vgroup_name)
+                  return
+              if err.code = 400 and (
+                      ERR_MSG_PENDING_ERADICATION in err.text):
+                  ctxt.reraise = False
+                  LOG.warning("Volume group %s is deleted but not"
+                              " eradicated - will recreate.", vgroup_name)
+                  source_array.eradicate_vgroup(vgroup_name)
+                  self._create_volume_group_if_not_exist(source_array,
+                                                         vgroup_name)
+
+    def _add_to_volume_group_if_needed(self, volume, vgroup_name):
+        """Add volume to volume group."""
+
+        if vgroup_name == None:
+            return False
+
+        current_array = self._get_current_array()
+        self._create_volume_group_if_not_exist(current_array, vgroup_name)
+
+        try:
+            current_array.move_volume(volume, vgroup_name)
+        except purestorage.PureHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 400 and
+                        ERR_MSG_NOT_EXIST in err.text):
+                    ctxt.reraise = raise_not_exist
+                    LOG.warning("Unable to move %(volume)s into group"
+                                " %(group_name)s, error "
+                                "message: %(error)s",
+                                {"volume": volume,
+                                 "group_name": vgroup_name, "error": err.text})
+                    return
+                if (err.code == 400 and
+                        ERR_MSG_ALREADY_BELONGS in err.text):
+                    # Happens if the volume already added to VG.
+                    ctxt.reraise = False
+                    LOG.warning("Adding Volume to Volume Group "
+                                "failed with message: %s", err.text)
 
     def _enable_async_replication_if_needed(self, array, volume):
         repl_type = self._get_replication_type_from_vol_type(
